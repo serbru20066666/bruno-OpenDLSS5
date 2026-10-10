@@ -109,9 +109,15 @@ class Rdna2Backend:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["passthrough", "onnx", "rdna2"], help="default: onnx if --model, else passthrough")
+    ap.add_argument("--backend", choices=["passthrough", "onnx", "rdna2", "sdturbo"], help="default: onnx if --model, else passthrough")
     ap.add_argument("--dll", default=str(__import__("pathlib").Path(__file__).resolve().parents[2] / "build" / "rdna2" / "rdna2.dll"))
-    ap.add_argument("--size", default="1280x720", help="network resolution for the rdna2 backend")
+    ap.add_argument("--size", default="1280x720", help="network resolution for the rdna2 / sdturbo backends (sdturbo: 1024x576)")
+    ap.add_argument("--sd-model", default=str(__import__("pathlib").Path(__file__).resolve().parents[2] / "models" / "sd-turbo"))
+    ap.add_argument("--prompt", default="photorealistic photograph, realistic human skin with pores, real materials, "
+                                        "cinematic lighting, sharp focus, highly detailed",
+                    help="sdturbo: what the regenerated frame should look like; describe the scene for better fidelity")
+    ap.add_argument("--strength", type=float, default=0.25,
+                    help="sdturbo: 0..1, how much of the frame is regenerated (0.15 subtle, 0.25 default, 0.4 strong)")
     ap.add_argument("--gain", type=float, default=1.0, help="rdna2: scale of the network residual (debug aid)")
     ap.add_argument("--capture", choices=["window", "screen"], default="window",
                     help="window: the game window's own content, even when covered (PrintWindow, slower); "
@@ -130,6 +136,11 @@ def main():
     if kind == "rdna2":
         w, h = (int(v) for v in a.size.lower().split("x"))
         backend = Rdna2Backend(a.dll, w, h, a.gain)
+    elif kind == "sdturbo":
+        from sdturbo import SdTurboBackend
+
+        w, h = (int(v) for v in a.size.lower().split("x"))
+        backend = SdTurboBackend(a.sd_model, w, h, a.prompt, a.strength)
     elif kind == "onnx":
         backend = OnnxBackend(a.model)
     else:
@@ -187,8 +198,12 @@ def main():
         else:
             frame = wcap.grab()
         if frame is None:
+            if not user32.IsWindow(hwnd):
+                print("the game window is gone; stopping", flush=True)
+                break
             if poll(10):
                 break
+            time.sleep(0.05)
             continue
         src = frame
         if a.infer_width and src.shape[1] > a.infer_width:

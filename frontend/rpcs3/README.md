@@ -28,6 +28,31 @@ running).
 not a more realistic image; `--gain` scales the network residual to make it visible. It proves the path frame ->
 network -> frame. A meaningful image needs real weights (a model directory loader is the next step).
 
+## Regenerating the frame with diffusion (`--backend sdturbo`)
+
+The backend that changes skin, materials and lighting: SD-Turbo image-to-image, one UNet evaluation per frame, through
+ONNX Runtime + DirectML (works on AMD). The weights are open (stabilityai/sd-turbo, Stability AI Community License) and
+are not part of this repository.
+
+```
+# once: fp16 weights into models/sd-turbo (see scripts/export_sdturbo.py), pip install torch diffusers transformers onnxconverter-common
+python scripts/export_sdturbo.py --size 1024x576
+python frontend/rpcs3/rpcs3_nr.py --title "God of War" --backend sdturbo --size 1024x576 --strength 0.25 --prompt "photorealistic photo, ..."
+python frontend/rpcs3/rpcs3_nr.py --backend sdturbo --size 1024x576 --strength 0.25 --image frame.png
+```
+
+Measured on an RX 6800 XT at 1024x576: about 570 ms per frame (1.8 fps): VAE encoder 160 ms, UNet 210 ms, VAE decoder
+160 ms.
+
+What to expect:
+
+* Close-ups work best: a face that fills the frame comes back with photographic skin, hair, cloth and lighting.
+* Small subjects are damaged. The latent is 8x smaller than the frame, so a character 50 pixels wide is about 6 latent
+  cells: faces, tattoos and armour details are reinvented. Wide gameplay shots of GoW3 show this on Kratos.
+* `--strength` trades fidelity for regeneration. Above about 0.4 the model starts replacing the scene.
+* The identity of a face changes, and nothing ties one frame to the next except a fixed noise tensor, so moving images
+  flicker. This is not NVIDIA's neural rendering network and does not have its temporal stability.
+
 ## A real open AI model today (`--model`, ONNX + DirectML)
 
 Until NR weights exist, a visible AI result comes from an open pretrained network: Real-ESRGAN's compact model
