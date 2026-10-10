@@ -1,21 +1,58 @@
 # bruno-OpenDLSS5
 
-> **Based on [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) by maan (MIT).** This is an independent,
-> open project (not a GitHub fork) that extends it with an **AMD (RDNA) backend** and an **RPCS3 / emulator
-> frontend**. Everything here is open source under the MIT License.
->
-> **Status: early work in progress.** The AMD backend and the RPCS3 frontend are not implemented yet; the code
-> below is still the upstream NVIDIA-only implementation.
->
-> **Roadmap**
-> 1. AMD compute backend: replace `VK_NV_cooperative_matrix2` / FP8 / `VK_NV_cuda_kernel_launch` with
->    `VK_KHR_cooperative_matrix` (RDNA3/4) and a packed-FP16 / DP4a path (RDNA2).
-> 2. Emulator frontend (RPCS3): window capture, inference, NR OFF/ON split comparison, temporal feedback.
-> 3. Validation against the upstream bit-exact reference.
->
-> **Weights are never included.** You supply your own model directory from a copy you legitimately own.
-> This project is clean-room: it is built from public documentation and the MIT-licensed upstream code only.
-> Not affiliated with NVIDIA or AMD.
+**Open-source Neural Rendering for AMD RDNA2 GPUs, focused on PS2 and PS3 emulators.**
+
+The goal of this project is to let anyone apply a DLSS-style Neural Rendering network (a network that re-renders
+an already drawn frame with more realistic materials, skin and lighting) on **AMD Radeon RX 6000 (RDNA2)** cards,
+in front of emulators such as **RPCS3 (PS3)** and **PCSX2 (PS2)**. RDNA2 has no matrix/AI instructions, so this
+means writing and optimising a compute backend for hardware the original network was never designed for. All of
+it is open, so other developers can help optimise it and extend it to RDNA3/RDNA4.
+
+**First target:** RPCS3 running **God of War III** (BCES00510) on an RX 6800 XT. PCSX2 and other games come
+after that works.
+
+## How it works
+
+```
+emulator window -> capture -> [ neural rendering backend ] -> NR OFF / NR ON view
+   (RPCS3)        (DXGI)       AMD compute (Vulkan)            split-screen
+```
+
+- **Frontend** (`frontend/rpcs3/`): captures the emulator window and shows a live NR OFF / NR ON comparison.
+  Works today as a prototype with pluggable backends (passthrough, ONNX via DirectML).
+- **Backend** (`src/`, `shaders/`): the network itself. Currently the upstream NVIDIA-only Vulkan code; the
+  AMD port is the main work item.
+- Emulators are not modified: the project works on the captured output, so it needs no per-game patches.
+
+## Roadmap
+
+1. [x] Open repo, MIT licence, attribution to the upstream project.
+2. [x] RPCS3 capture frontend with NR OFF / NR ON split view (prototype).
+3. [ ] Measure capture + display overhead and baseline fps with GoW3 on RDNA2.
+4. [ ] AMD compute backend: replace `VK_NV_cooperative_matrix2` / FP8 / `VK_NV_cuda_kernel_launch` with
+   `VK_KHR_cooperative_matrix` (RDNA3/4) and a packed-FP16 / DP4a path (RDNA2).
+5. [ ] Validate numerically against the upstream bit-exact reference.
+6. [ ] Temporal feedback to avoid flicker between frames.
+7. [ ] PCSX2 (PS2) support, then other emulators.
+
+## Expectations on RDNA2
+
+RDNA2 has no AI/matrix units, so the network is expected to run several times slower than on RTX 40 / RX 7000
+or newer cards. Early on, expect low frame rates (useful for screenshots, validation and experimenting) rather
+than smooth real-time play. Real-time on RDNA2 is a goal that depends on optimisation work and on how far the
+network can be reduced; contributions are welcome.
+
+## Based on OpenDLSS-NR
+
+This is an independent project (not a GitHub fork) built on
+[OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) by maan (MIT), an open Vulkan reimplementation of the
+network. It is developed clean-room, from public documentation and MIT-licensed code only.
+
+**Weights are never included or redistributed.** You supply your own model directory from a copy you
+legitimately own. Not affiliated with, endorsed by, or supported by NVIDIA or AMD. "DLSS" is a trademark of
+NVIDIA Corporation, used only to describe compatibility.
+
+**Status: early work in progress.** The AMD backend is not implemented yet.
 
 ---
 
