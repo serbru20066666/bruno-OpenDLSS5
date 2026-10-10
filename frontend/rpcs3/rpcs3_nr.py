@@ -64,9 +64,13 @@ class OnnxBackend:
             path, providers=providers or ["DmlExecutionProvider", "CPUExecutionProvider"]
         )
         self.inp = self.sess.get_inputs()[0].name
-        print("providers:", self.sess.get_providers())
+        shape = self.sess.get_inputs()[0].shape   # [1, 3, H, W]; H / W are ints when the model has a fixed size
+        self.fixed = (shape[3], shape[2]) if isinstance(shape[2], int) and isinstance(shape[3], int) else None
+        print("providers:", self.sess.get_providers(), "| model input:", self.fixed or "dynamic", flush=True)
 
     def __call__(self, bgr):
+        if self.fixed and (bgr.shape[1], bgr.shape[0]) != self.fixed:
+            bgr = cv2.resize(bgr, self.fixed, interpolation=cv2.INTER_AREA)
         x = bgr[:, :, ::-1].astype(np.float32).transpose(2, 0, 1)[None] / 255.0
         y = self.sess.run(None, {self.inp: x})[0][0]
         y = (np.clip(y, 0, 1) * 255).astype(np.uint8).transpose(1, 2, 0)[:, :, ::-1]
@@ -109,6 +113,11 @@ def main():
     ap.add_argument("--dll", default=str(__import__("pathlib").Path(__file__).resolve().parents[2] / "build" / "rdna2" / "rdna2.dll"))
     ap.add_argument("--size", default="1280x720", help="network resolution for the rdna2 backend")
     ap.add_argument("--gain", type=float, default=1.0, help="rdna2: scale of the network residual (debug aid)")
+    ap.add_argument("--capture", choices=["window", "screen"], default="window",
+                    help="window: the game window's own content, even when covered (PrintWindow, slower); "
+                         "screen: desktop duplication of the window's area (fast, but captures whatever is on top)")
+    ap.add_argument("--no-window", action="store_true", help="do not open the viewer (with --snapshot / --exit-after)")
+    ap.add_argument("--exit-after", type=int, default=0, help="live mode: quit after this many frames (unattended tests)")
     ap.add_argument("--snapshot", help="live mode: write the split view to this file at frame 30 (and print timings)")
     ap.add_argument("--image", help="process one image file instead of capturing; writes <image>.nr.png and exits")
     ap.add_argument("--title", default="RPCS3", help="substring of the window title (e.g. 'God of War III')")
@@ -138,14 +147,19 @@ def main():
         print(f"wrote {a.image}.nr.png | mean abs difference {diff.mean():.2f} / 255, max {diff.max()}", flush=True)
         return
 
-    import dxcam
-
     wins = find_window(a.title)
     if not wins:
         sys.exit(f"No visible window containing '{a.title}'. Start the game in RPCS3 first.")
     hwnd, title = wins[0]
     print("capturing:", title, flush=True)
-    cam = dxcam.create(output_idx=0, output_color="BGR")
+    if a.capture == "screen":
+        import dxcam
+
+        cam = dxcam.create(output_idx=0, output_color="BGR")
+    else:
+        from wincap import WindowCapture
+
+        wcap = WindowCapture(hwnd)
     split = [0.5]
 
     def on_mouse(ev, x, y, flags, param):
@@ -153,22 +167,27 @@ def main():
             split[0] = min(max(x / param["w"], 0.0), 1.0)
 
     win = "bruno-OpenDLSS5  |  NR OFF <-> NR ON"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     mp = {"w": 0}
-    cv2.setMouseCallback(win, on_mouse, mp)
+    if not a.no_window:
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(win, on_mouse, mp)
+
+    def poll(ms=1):   # True = quit requested
+        if a.no_window:
+            return False
+        return cv2.waitKey(ms) & 0xFF in (27, ord("q"))
 
     t_prev, ema_inf, ema_fps, shown = time.time(), 0.0, 0.0, 0
     while True:
-        l, t, r, b = client_rect(hwnd)
-        # clip to the monitor: a maximised or partly off-screen window reports a rectangle past its edges
-        l, t, r, b = max(l, 0), max(t, 0), min(r, cam.width), min(b, cam.height)
-        if r - l < 64 or b - t < 64:
-            if cv2.waitKey(100) & 0xFF in (27, ord("q")):
-                break
-            continue
-        frame = cam.grab(region=(l, t, r, b))
+        if a.capture == "screen":
+            l, t, r, b = client_rect(hwnd)
+            # clip to the monitor: a maximised or partly off-screen window reports a rectangle past its edges
+            l, t, r, b = max(l, 0), max(t, 0), min(r, cam.width), min(b, cam.height)
+            frame = cam.grab(region=(l, t, r, b)) if r - l >= 64 and b - t >= 64 else None
+        else:
+            frame = wcap.grab()
         if frame is None:
-            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+            if poll(10):
                 break
             continue
         src = frame
@@ -197,14 +216,17 @@ def main():
         t_prev = now
         cv2.putText(view, f"{backend.name} | infer {ema_inf:.1f} ms | {ema_fps:.0f} fps", (16, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow(win, view)
+        if not a.no_window:
+            cv2.imshow(win, view)
         shown += 1
-        if a.snapshot and shown == 30:
+        if a.snapshot and shown == min(30, a.exit_after or 30):
             cv2.imwrite(a.snapshot, view)
+            cv2.imwrite(a.snapshot + ".off.png", base)
+            cv2.imwrite(a.snapshot + ".on.png", out)
             gpu = getattr(backend, "gpu_ms", None)
             print(f"snapshot {a.snapshot} | capture {w}x{h} | backend {ema_inf:.1f} ms"
                   + (f" (GPU {gpu:.1f} ms)" if gpu else "") + f" | {ema_fps:.1f} fps", flush=True)
-        if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+        if poll() or (a.exit_after and shown >= a.exit_after):
             break
     cv2.destroyAllWindows()
 
