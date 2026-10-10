@@ -13,17 +13,16 @@ windowed or borderless. The native DLSS-NR Vulkan backend will plug in as anothe
 
 ## The NR network on the GPU (`--backend rdna2`)
 
-Build `build
-dna2
-dna2.dll` first (`powershell -File rdna2uild.ps1`), then:
+Build `build/rdna2/rdna2.dll` first (`powershell -File rdna2/build.ps1`), then:
 
 ```
-python rpcs3_nr.py --title "God of War III" --backend rdna2 --gain 8      # live, NR OFF / NR ON split
+python rpcs3_nr.py --title "God of War" --backend rdna2 --gain 8          # live, NR OFF / NR ON split
 python rpcs3_nr.py --backend rdna2 --gain 8 --image some.png              # one image -> some.png.nr.png
 ```
 
 The captured frame is resized to `--size` (default 1280x720), run through the 71-block network and resized back, so the
-emulator can stay at any resolution. About 65 ms of GPU time per frame on an RX 6800 XT.
+emulator can stay at any resolution. About 65 ms of GPU time per frame on an RX 6800 XT (about 80 ms with the game
+running).
 
 **The weights are synthetic for now**, so the "NR ON" side shows the frame plus structured noise and a colour shift,
 not a more realistic image; `--gain` scales the network residual to make it visible. It proves the path frame ->
@@ -36,9 +35,9 @@ Until NR weights exist, a visible AI result comes from an open pretrained networ
 edges), not neural rendering: it does not change materials, skin or lighting.
 
 ```
-# once: download realesr-general-x4v3.pth (release v0.2.5.0) into modelsealesrgan\, pip install torch (CPU is enough)
-python scripts\convert_realesrgan.py --size 1280x720
-python frontendpcs3pcs3_nr.py --title "God of War" --model modelsealesrganealesr-general-x4v3_1280x720.onnx
+# once: download realesr-general-x4v3.pth (release v0.2.5.0) into models/realesrgan/, pip install torch (CPU is enough)
+python scripts/convert_realesrgan.py --size 1280x720
+python frontend/rpcs3/rpcs3_nr.py --title "God of War" --model models/realesrgan/realesr-general-x4v3_1280x720.onnx
 ```
 
 Measured on an RX 6800 XT while the game was running: 640x360 input about 130 ms per frame (7.8 fps), 1280x720 input
