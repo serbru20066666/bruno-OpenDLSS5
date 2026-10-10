@@ -179,6 +179,7 @@ def main():
 
     win = "bruno-OpenDLSS5  |  NR OFF <-> NR ON"
     mp = {"w": 0}
+    opened = [False]   # the viewer has shown at least one frame
     if not a.no_window:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(win, on_mouse, mp)
@@ -186,7 +187,10 @@ def main():
     def poll(ms=1):   # True = quit requested
         if a.no_window:
             return False
-        return cv2.waitKey(ms) & 0xFF in (27, ord("q"))
+        if cv2.waitKey(ms) & 0xFF in (27, ord("q")):
+            return True
+        # closing the viewer with its X button also quits (imshow would otherwise recreate the window)
+        return opened[0] and cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1
 
     t_prev, ema_inf, ema_fps, shown = time.time(), 0.0, 0.0, 0
     while True:
@@ -233,6 +237,7 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         if not a.no_window:
             cv2.imshow(win, view)
+            opened[0] = True
         shown += 1
         if a.snapshot and shown == min(30, a.exit_after or 30):
             cv2.imwrite(a.snapshot, view)
