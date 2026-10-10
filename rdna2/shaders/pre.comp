@@ -1,0 +1,35 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Input features (docs/network.md): RGBA8 frame -> f16 [field][16]. Outside the valid rectangle the image is mirrored
+// (2 * valid - x - 2) while the noise still hashes the padded coordinate. No history yet: lanes 7-9 copy lanes 4-6.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer In { uint px[]; };       // [H][W] RGBA8 (R in the low byte)
+layout(std430, set = 0, binding = 2) writeonly buffer Out { f16vec2 f[]; };   // [fh * fw][16]
+layout(std430, set = 0, binding = 4) readonly buffer Params { uint seed; float style, tone, structure, skin, mask, gain; } prm;
+layout(push_constant) uniform P { uint W, H, fw, fh; } p;
+uint hash(uint v) {
+  v ^= v >> 16; v *= 0x7feb352du; v ^= v >> 15; v *= 0x846ca68bu; v ^= v >> 16;
+  return v;
+}
+float unit(uint v) { return (float(v >> 8) + 0.5) / 16777216.0; }
+void main() {
+  uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+  if (x >= p.fw || y >= p.fh) return;
+  int sx = x < p.W ? int(x) : max(0, 2 * int(p.W) - int(x) - 2), sy = y < p.H ? int(y) : max(0, 2 * int(p.H) - int(y) - 2);
+  uint c = px[uint(sy) * p.W + uint(sx)];
+  vec3 rgb = vec3(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u)) / 255.0;
+  vec3 proxy = (rgb - 0.5) * 0.125;
+  uint h0 = hash(x + y * 65536u + prm.seed * 0x9e3779b9u), h1 = hash(h0 ^ 0x68bc21ebu), h2 = hash(h1 ^ 0x02e5be93u), h3 = hash(h2 ^ 0x1b873593u);
+  float r0 = sqrt(-2.0 * log(unit(h0))), a0 = 6.2831853 * unit(h1), r1 = sqrt(-2.0 * log(unit(h2))), a1 = 6.2831853 * unit(h3);
+  vec3 noise = vec3(r0 * cos(a0), r0 * sin(a0), r1 * cos(a1));
+  uint o = (y * p.fw + x) * 8;
+  f[o + 0] = f16vec2(noise.xy);
+  f[o + 1] = f16vec2(noise.z, 1.0);
+  f[o + 2] = f16vec2(proxy.xy);
+  f[o + 3] = f16vec2(proxy.z, proxy.x);
+  f[o + 4] = f16vec2(proxy.yz);
+  f[o + 5] = f16vec2(prm.style / 128.0, prm.tone);
+  f[o + 6] = f16vec2(prm.structure, prm.skin);
+  f[o + 7] = f16vec2(prm.mask, 0.0);
+}

@@ -73,13 +73,69 @@ class OnnxBackend:
         return np.ascontiguousarray(y)
 
 
+class Rdna2Backend:
+    """The NR network on the GPU through build/rdna2/rdna2.dll (Vulkan compute, no NVIDIA extensions).
+
+    The frame is resized to the network size, run, and resized back. Weights are synthetic until a model directory
+    loader exists, so the residual is not a meaningful image; `gain` scales it to make it visible.
+    """
+
+    def __init__(self, dll, width, height, gain):
+        import ctypes as c
+        import os
+
+        dll = os.path.abspath(dll)
+        self.lib = c.CDLL(dll)
+        self.lib.nr_create.argtypes = [c.c_int, c.c_int, c.c_char_p]
+        self.lib.nr_frame.argtypes = [c.c_void_p, c.c_void_p, c.c_float, c.c_float, c.c_float, c.c_float, c.c_float]
+        self.lib.nr_frame.restype = c.c_double
+        if self.lib.nr_create(width, height, os.path.dirname(dll).encode()) != 0:
+            sys.exit("rdna2 backend failed to start")
+        self.w, self.h, self.gain = width, height, gain
+        self.out = np.empty((height, width, 4), np.uint8)
+        self.gpu_ms = 0.0
+        self.name = f"rdna2 {width}x{height} (synthetic weights)"
+
+    def __call__(self, bgr):
+        src = cv2.resize(bgr, (self.w, self.h), interpolation=cv2.INTER_AREA)
+        rgba = np.ascontiguousarray(cv2.cvtColor(src, cv2.COLOR_BGR2RGBA))
+        self.gpu_ms = self.lib.nr_frame(rgba.ctypes.data, self.out.ctypes.data, self.gain, 0.0, 0.0, 0.0, 0.0)
+        return cv2.cvtColor(self.out, cv2.COLOR_RGBA2BGR)
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--backend", choices=["passthrough", "onnx", "rdna2"], help="default: onnx if --model, else passthrough")
+    ap.add_argument("--dll", default=str(__import__("pathlib").Path(__file__).resolve().parents[2] / "build" / "rdna2" / "rdna2.dll"))
+    ap.add_argument("--size", default="1280x720", help="network resolution for the rdna2 backend")
+    ap.add_argument("--gain", type=float, default=1.0, help="rdna2: scale of the network residual (debug aid)")
+    ap.add_argument("--image", help="process one image file instead of capturing; writes <image>.nr.png and exits")
     ap.add_argument("--title", default="RPCS3", help="substring of the window title (e.g. 'God of War III')")
     ap.add_argument("--model", help="ONNX image->image model; omit for passthrough")
     ap.add_argument("--infer-width", type=int, default=0, help="downscale capture to this width before inference")
     ap.add_argument("--fps", type=int, default=60)
     a = ap.parse_args()
+
+    kind = a.backend or ("onnx" if a.model else "passthrough")
+    if kind == "rdna2":
+        w, h = (int(v) for v in a.size.lower().split("x"))
+        backend = Rdna2Backend(a.dll, w, h, a.gain)
+    elif kind == "onnx":
+        backend = OnnxBackend(a.model)
+    else:
+        backend = Passthrough()
+
+    if a.image:
+        img = cv2.imread(a.image)
+        if img is None:
+            sys.exit(f"cannot read {a.image}")
+        out = backend(img)
+        # compare at the backend's resolution, so the resize itself does not count as a difference
+        base = img if out.shape[:2] == img.shape[:2] else cv2.resize(img, (out.shape[1], out.shape[0]), interpolation=cv2.INTER_AREA)
+        diff = np.abs(out.astype(np.int16) - base.astype(np.int16))
+        cv2.imwrite(a.image + ".nr.png", out)
+        print(f"wrote {a.image}.nr.png | mean abs difference {diff.mean():.2f} / 255, max {diff.max()}", flush=True)
+        return
 
     import dxcam
 
@@ -87,9 +143,7 @@ def main():
     if not wins:
         sys.exit(f"No visible window containing '{a.title}'. Start the game in RPCS3 first.")
     hwnd, title = wins[0]
-    print("capturing:", title)
-
-    backend = OnnxBackend(a.model) if a.model else Passthrough()
+    print("capturing:", title, flush=True)
     cam = dxcam.create(output_idx=0, output_color="BGR")
     split = [0.5]
 

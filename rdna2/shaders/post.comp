@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Composition (docs/network.md): neural = clamp(proxy + rgb / 4, 0, 1) in the proxy's sRGB code space. `gain` scales the
+// residual (1 = the network's own output; larger values are a debugging aid). No temporal blend yet.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer In { uint px[]; };          // [H][W] RGBA8
+layout(std430, set = 0, binding = 1) readonly buffer Head { f16vec2 head[]; };   // [fh * fw][32]: r g | b logit | padding
+layout(std430, set = 0, binding = 2) writeonly buffer Out { uint outPx[]; };    // [H][W] RGBA8
+layout(std430, set = 0, binding = 4) readonly buffer Params { uint seed; float style, tone, structure, skin, mask, gain; } prm;
+layout(push_constant) uniform P { uint W, H, fw, fh; } p;
+void main() {
+  uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+  if (x >= p.W || y >= p.H) return;
+  uint c = px[y * p.W + x];
+  vec3 rgb = vec3(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u)) / 255.0;
+  uint o = (y * p.fw + x) * 16;
+  vec3 res = vec3(vec2(head[o]), float(head[o + 1].x));
+  if (any(isnan(res)) || any(isinf(res))) res = vec3(0.0);
+  vec3 v = clamp(rgb + prm.gain * res * 0.25, 0.0, 1.0);
+  uvec3 q = uvec3(v * 255.0 + 0.5);
+  outPx[y * p.W + x] = q.x | (q.y << 8) | (q.z << 16) | 0xff000000u;
+}

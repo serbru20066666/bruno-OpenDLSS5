@@ -87,8 +87,9 @@ static float rnd() {   // uniform in [-1, 1)
   return (float)((rngState >> 40) & 0xffffff) / 8388608.0f - 1.0f;
 }
 
-enum Shader { GEMM, WATTN, GATTN, OPS, SHADER_COUNT };
-static const char* shaderFiles[SHADER_COUNT] = {"gemm.spv", "wattn.spv", "gattn.spv", "ops.spv"};
+enum Shader { GEMM, WATTN, GATTN, OPS, PRE, POST, SHADER_COUNT };
+static const char* shaderFiles[SHADER_COUNT] = {"gemm.spv", "wattn.spv", "gattn.spv", "ops.spv", "pre.spv", "post.spv"};
+static std::string shaderDir;   // "" = current directory
 
 struct Net {
   VkQueue queue;
@@ -306,7 +307,26 @@ struct Net {
 
 struct Dim { uint32_t w, h; };
 
-int main(int argc, char** argv) {
+// Per-frame parameters read by pre.comp / post.comp (std430).
+struct FrameParams { uint32_t seed; float style, tone, structure, skin, mask, gain; };
+
+// What a frame needs after setup(): host-visible frame buffers and the recorded command buffer.
+static struct Runtime {
+  Net* net = nullptr;
+  View in, out, params;
+  void *inMap = nullptr, *outMap = nullptr, *paramsMap = nullptr;
+  uint32_t W = 0, H = 0, frame = 0;
+} rt;
+
+static View makeMapped(VkDeviceSize size, void** map) {
+  View v = makeBuffer(size, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  CK(vkMapMemory(dev, allBuffers.back().second, 0, VK_WHOLE_SIZE, 0, map));
+  return v;
+}
+
+// Creates the device, records the whole network for W x H and uploads the weights. library = stop there (frames are
+// then run with runFrame); otherwise benchmark.
+static int setup(int argc, char** argv, bool library) {
   uint32_t W = argc > 2 ? atoi(argv[1]) : 1280, H = argc > 2 ? atoi(argv[2]) : 720;
   CK(volkInitialize());
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -354,12 +374,15 @@ int main(int argc, char** argv) {
   CK(vkCreateDevice(phys, &dci, nullptr, &dev));
   volkLoadDevice(dev);
 
-  Net net;
+  static Net net;
+  rt.net = &net;
+  rt.W = W;
+  rt.H = H;
   net.profile = argc > 4 && !strcmp(argv[4], "profile");
   net.family = qi.queueFamilyIndex;
   vkGetDeviceQueue(dev, net.family, 0, &net.queue);
   for (int i = 0; i < SHADER_COUNT; i++) {
-    std::ifstream f(shaderFiles[i], std::ios::binary);
+    std::ifstream f(shaderDir + shaderFiles[i], std::ios::binary);
     std::vector<char> spv((std::istreambuf_iterator<char>(f)), {});
     if (spv.empty()) { printf("cannot read %s (run from the directory with the .spv files)\n", shaderFiles[i]); return 1; }
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -418,10 +441,19 @@ int main(int argc, char** argv) {
   printf("\n");
 
   Act feat = net.newAct(fw * fh, 16);
+  rt.in = makeMapped((VkDeviceSize)W * H * 4, &rt.inMap);
+  rt.out = makeMapped((VkDeviceSize)W * H * 4, &rt.outMap);
+  rt.params = makeMapped(256, &rt.paramsMap);
+  const uint32_t framePush[4] = {W, H, fw, fh};
   VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   CK(vkBeginCommandBuffer(net.cb, &beginInfo));
   vkCmdResetQueryPool(net.cb, net.qpool, 0, 1024);
   net.mark("start");
+  {
+    const View* b[5] = {&rt.in, nullptr, &feat.v, nullptr, &rt.params};
+    net.label = "preprocess";
+    net.dispatch(PRE, net.noSpec, b, framePush, sizeof framePush, fw / 16, fh / 16, 1);
+  }
 
   // Encoder
   Act b0in = net.newAct(fw * fh, 32);
@@ -466,16 +498,19 @@ int main(int argc, char** argv) {
     Act b70 = net.windowBlock(up, fw, fh, 32, 6);
     Act head = net.newAct(fw * fh, 32);  // 32 -> 4 head, padded to 32 columns
     net.gemm(b70.v, net.W(32 * 32), head.v, nullptr, nullptr, fw * fh, 32, 32, 32, 32, 0, false);
-    net.mark("block 70 + head (full res)");
+    const View* b[5] = {&rt.in, &head.v, &rt.out, nullptr, &rt.params};
+    net.label = "compose";
+    net.dispatch(POST, net.noSpec, b, framePush, sizeof framePush, (W + 15) / 16, (H + 15) / 16, 1);
+    net.mark("block 70 + head + compose");
     VkBufferCopy bc{0, 0, 64};
     vkCmdCopyBuffer(net.cb, head.v.buffer, readback.buffer, 1, &bc);
   }
   CK(vkEndCommandBuffer(net.cb));
   printf("recorded %u dispatches, synthetic weights %.0f MiB (f16)\n", net.dispatches, net.weightHalves * 2 / 1048576.0);
 
-  {  // synthetic data: random weights and input features, uploaded once through a staging buffer
-    VkDeviceSize wBytes = net.weightCursor, fBytes = feat.v.size;
-    View staging = makeBuffer(wBytes + fBytes, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  {  // synthetic data: random weights, uploaded once through a staging buffer; a random test frame
+    VkDeviceSize wBytes = net.weightCursor;
+    View staging = makeBuffer(wBytes, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void* map;
     CK(vkMapMemory(dev, allBuffers.back().second, 0, VK_WHOLE_SIZE, 0, &map));
     uint16_t* hw = (uint16_t*)map;
@@ -485,14 +520,15 @@ int main(int argc, char** argv) {
       if (in.constant) { uint16_t c = toHalf(in.amp); for (uint64_t i = 0; i < in.halves; i++) dst[i] = c; }
       else for (uint64_t i = 0; i < in.halves; i++) dst[i] = toHalf(rnd() * in.amp);
     }
-    uint16_t* hf = hw + wBytes / 2;
-    for (uint64_t i = 0; i < fBytes / 2; i++) hf[i] = toHalf(rnd() * 0.5f);
+    uint8_t* test = (uint8_t*)rt.inMap;
+    for (uint64_t i = 0; i < (uint64_t)W * H * 4; i++) test[i] = (uint8_t)(rnd() * 127.0f + 128.0f);
+    FrameParams fp{1, 0, 0, 0, 0, 0, 1};
+    memcpy(rt.paramsMap, &fp, sizeof fp);
     VkCommandBuffer up;
     CK(vkAllocateCommandBuffers(dev, &cai, &up));
     CK(vkBeginCommandBuffer(up, &beginInfo));
-    VkBufferCopy c1{0, 0, wBytes}, c2{wBytes, 0, fBytes};
+    VkBufferCopy c1{0, 0, wBytes};
     vkCmdCopyBuffer(up, staging.buffer, net.weights.buffer, 1, &c1);
-    vkCmdCopyBuffer(up, staging.buffer, feat.v.buffer, 1, &c2);
     vkCmdFillBuffer(up, net.dummy.buffer, 0, VK_WHOLE_SIZE, 0);
     CK(vkEndCommandBuffer(up));
     VkSubmitInfo us{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -501,6 +537,7 @@ int main(int argc, char** argv) {
     CK(vkQueueSubmit(net.queue, 1, &us, VK_NULL_HANDLE));
     CK(vkQueueWaitIdle(net.queue));
   }
+  if (library) return 0;
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &net.cb;
@@ -556,3 +593,40 @@ int main(int argc, char** argv) {
   printf("  (synthetic weights: not an image; finite non-zero values mean the data path is alive)\n");
   return 0;
 }
+
+// One frame: RGBA8 in (W * H * 4 bytes), RGBA8 out. Returns the GPU time of the frame in milliseconds.
+static double runFrame(const uint8_t* rgba, uint8_t* outRgba, const FrameParams& params) {
+  Net& net = *rt.net;
+  memcpy(rt.inMap, rgba, (size_t)rt.W * rt.H * 4);
+  memcpy(rt.paramsMap, &params, sizeof params);
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &net.cb;
+  CK(vkQueueSubmit(net.queue, 1, &si, VK_NULL_HANDLE));
+  CK(vkQueueWaitIdle(net.queue));
+  memcpy(outRgba, rt.outMap, (size_t)rt.W * rt.H * 4);
+  uint64_t ts[2];
+  CK(vkGetQueryPoolResults(dev, net.qpool, 0, 1, 8, &ts[0], 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+  CK(vkGetQueryPoolResults(dev, net.qpool, net.queries - 1, 1, 8, &ts[1], 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+  return (ts[1] - ts[0]) * props.limits.timestampPeriod * 1e-6;
+}
+
+#ifdef RDNA2_DLL
+// C API for frontends (frontend/rpcs3 loads it with ctypes). shaderDirectory holds the .spv files.
+extern "C" {
+__declspec(dllexport) int nr_create(int width, int height, const char* shaderDirectory) {
+  shaderDir = std::string(shaderDirectory) + "/";
+  char w[16], h[16], name[] = "rdna2";
+  snprintf(w, sizeof w, "%d", width);
+  snprintf(h, sizeof h, "%d", height);
+  char* argv[3] = {name, w, h};
+  return setup(3, argv, true);
+}
+__declspec(dllexport) double nr_frame(const uint8_t* rgba, uint8_t* outRgba, float gain, float style, float tone, float structure, float skin) {
+  FrameParams params{++rt.frame, style, tone, structure, skin, 0.0f, gain};
+  return runFrame(rgba, outRgba, params);
+}
+}
+#else
+int main(int argc, char** argv) { return setup(argc, argv, false); }
+#endif
