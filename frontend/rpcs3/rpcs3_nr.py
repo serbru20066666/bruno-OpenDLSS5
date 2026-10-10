@@ -109,6 +109,7 @@ def main():
     ap.add_argument("--dll", default=str(__import__("pathlib").Path(__file__).resolve().parents[2] / "build" / "rdna2" / "rdna2.dll"))
     ap.add_argument("--size", default="1280x720", help="network resolution for the rdna2 backend")
     ap.add_argument("--gain", type=float, default=1.0, help="rdna2: scale of the network residual (debug aid)")
+    ap.add_argument("--snapshot", help="live mode: write the split view to this file at frame 30 (and print timings)")
     ap.add_argument("--image", help="process one image file instead of capturing; writes <image>.nr.png and exits")
     ap.add_argument("--title", default="RPCS3", help="substring of the window title (e.g. 'God of War III')")
     ap.add_argument("--model", help="ONNX image->image model; omit for passthrough")
@@ -156,9 +157,15 @@ def main():
     mp = {"w": 0}
     cv2.setMouseCallback(win, on_mouse, mp)
 
-    t_prev, ema_inf, ema_fps = time.time(), 0.0, 0.0
+    t_prev, ema_inf, ema_fps, shown = time.time(), 0.0, 0.0, 0
     while True:
         l, t, r, b = client_rect(hwnd)
+        # clip to the monitor: a maximised or partly off-screen window reports a rectangle past its edges
+        l, t, r, b = max(l, 0), max(t, 0), min(r, cam.width), min(b, cam.height)
+        if r - l < 64 or b - t < 64:
+            if cv2.waitKey(100) & 0xFF in (27, ord("q")):
+                break
+            continue
         frame = cam.grab(region=(l, t, r, b))
         if frame is None:
             if cv2.waitKey(1) & 0xFF in (27, ord("q")):
@@ -191,6 +198,12 @@ def main():
         cv2.putText(view, f"{backend.name} | infer {ema_inf:.1f} ms | {ema_fps:.0f} fps", (16, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(win, view)
+        shown += 1
+        if a.snapshot and shown == 30:
+            cv2.imwrite(a.snapshot, view)
+            gpu = getattr(backend, "gpu_ms", None)
+            print(f"snapshot {a.snapshot} | capture {w}x{h} | backend {ema_inf:.1f} ms"
+                  + (f" (GPU {gpu:.1f} ms)" if gpu else "") + f" | {ema_fps:.1f} fps", flush=True)
         if cv2.waitKey(1) & 0xFF in (27, ord("q")):
             break
     cv2.destroyAllWindows()
