@@ -1,0 +1,32 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// ViT global attention over all coarsest-level tokens: one thread per (token, head), 32-channel heads, scaled cosine.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer QKV { float16_t qkv[]; };    // [tokens][3C]
+layout(std430, set = 0, binding = 2) writeonly buffer Out { float16_t outv[]; };  // [tokens][C]
+layout(push_constant) uniform P { uint tokens, C, heads; float qscale; } p;
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.tokens * p.heads) return;
+  uint h = gid % p.heads, tok = gid / p.heads;
+  uint stride = 3 * p.C;
+  float q[32];
+  float qn = 0.0;
+  for (uint d = 0; d < 32; d++) { q[d] = float(qkv[tok * stride + h * 32 + d]); qn += q[d] * q[d]; }
+  float qi = p.qscale * inversesqrt(qn + 1e-6);
+  float o[32];
+  for (uint d = 0; d < 32; d++) o[d] = 0.0;
+  float sum = 0.0;
+  for (uint j = 0; j < p.tokens; j++) {
+    uint kb = j * stride + p.C + h * 32;
+    float dotv = 0.0, kn = 0.0;
+    for (uint d = 0; d < 32; d++) { float k = float(qkv[kb + d]); dotv += q[d] * k; kn += k * k; }
+    float e = exp(dotv * qi * inversesqrt(kn + 1e-6));
+    sum += e;
+    uint vb = kb + p.C;
+    for (uint d = 0; d < 32; d++) o[d] += e * float(qkv[vb + d]);
+  }
+  float inv = 1.0 / sum;
+  for (uint d = 0; d < 32; d++) outv[tok * p.C + h * 32 + d] = float16_t(o[d] * inv);
+}

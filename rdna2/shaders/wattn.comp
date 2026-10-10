@@ -1,0 +1,54 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// 8x8 shifted-window scaled-cosine attention. One workgroup = one window x one head (32 channels), one thread per token.
+// Tokens outside the field are zero vectors that still take part (score = prior + 0), as in the reference graph.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer QKV { f16vec2 qkv[]; };         // [tokens][3C] q | k | v
+layout(std430, set = 0, binding = 1) readonly buffer Prior { float16_t prior[]; };   // [heads][64][64]
+layout(std430, set = 0, binding = 2) writeonly buffer Out { f16vec2 outv[]; };      // [tokens][C]
+layout(push_constant) uniform P { uint W, H, C, heads, shiftX, shiftY, nwx; float qscale; } p;
+shared f16vec2 sk[64][17];
+shared f16vec2 sv[64][17];
+void main() {
+  uint t = gl_LocalInvocationID.x, h = gl_WorkGroupID.y, win = gl_WorkGroupID.x;
+  uint wx = win % p.nwx, wy = win / p.nwx, tx = t & 7u, ty = t >> 3;
+  int px = int(wx * 8 + tx) - int(p.shiftX), py = int(wy * 8 + ty) - int(p.shiftY);
+  bool valid = px >= 0 && px < int(p.W) && py >= 0 && py < int(p.H);
+  f16vec2 q[16];
+  float qn = 0.0, kn = 0.0;
+  uint base = valid ? ((uint(py) * p.W + uint(px)) * 3 * p.C + h * 32) / 2 : 0;
+  uint half_c = p.C / 2;
+  for (uint d = 0; d < 16; d++) {
+    f16vec2 qq = valid ? qkv[base + d] : f16vec2(0.0hf);
+    f16vec2 kk = valid ? qkv[base + half_c + d] : f16vec2(0.0hf);
+    sv[t][d] = valid ? qkv[base + 2 * half_c + d] : f16vec2(0.0hf);
+    q[d] = qq;
+    sk[t][d] = kk;
+    qn += float(qq.x) * float(qq.x) + float(qq.y) * float(qq.y);
+    kn += float(kk.x) * float(kk.x) + float(kk.y) * float(kk.y);
+  }
+  float qi = valid ? p.qscale * inversesqrt(qn + 1e-6) : 0.0, ki = valid ? inversesqrt(kn + 1e-6) : 0.0;
+  for (uint d = 0; d < 16; d++) {
+    q[d] = f16vec2(vec2(q[d]) * qi);
+    sk[t][d] = f16vec2(vec2(sk[t][d]) * ki);
+  }
+  barrier();
+  f16vec2 o[16];
+  for (uint d = 0; d < 16; d++) o[d] = f16vec2(0.0hf);
+  float sum = 0.0;
+  for (uint j = 0; j < 64; j++) {
+    f16vec2 acc = f16vec2(0.0hf);
+    for (uint d = 0; d < 16; d++) acc = fma(q[d], sk[j][d], acc);
+    float s = float(acc.x) + float(acc.y) + float(prior[h * 4096 + t * 64 + j]);
+    float e = exp(s);
+    sum += e;
+    f16vec2 e2 = f16vec2(float16_t(e));
+    for (uint d = 0; d < 16; d++) o[d] = fma(e2, sv[j][d], o[d]);
+  }
+  if (valid) {
+    float inv = 1.0 / sum;
+    uint ob = ((uint(py) * p.W + uint(px)) * p.C + h * 32) / 2;
+    for (uint d = 0; d < 16; d++) outv[ob + d] = f16vec2(vec2(o[d]) * inv);
+  }
+}
