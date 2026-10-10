@@ -5,6 +5,7 @@
 //
 //   rdna2_net [width height]        default 1280 720; run from the directory holding the .spv files
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +57,7 @@ static View makeBuffer(VkDeviceSize size, VkMemoryPropertyFlags flags = VK_MEMOR
   return {b, 0, size};
 }
 
+// activation rows are padded to the tallest GEMM tile (128 rows), so kernels need no row bounds checks
 static uint32_t pad128(uint32_t v) { return (v + 127) / 128 * 128; }
 static uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 
@@ -63,6 +65,27 @@ struct Act {
   View v;
   uint32_t tokens = 0, C = 0;
 };
+
+static uint16_t toHalf(float f) {
+  uint32_t x;
+  memcpy(&x, &f, 4);
+  uint32_t sign = (x >> 16) & 0x8000;
+  int e = (int)((x >> 23) & 0xff) - 127 + 15;
+  uint32_t m = x & 0x7fffff;
+  if (e <= 0) return (uint16_t)sign;                       // underflow to zero (no denormals needed here)
+  if (e >= 31) return (uint16_t)(sign | 0x7c00);
+  return (uint16_t)(sign | (e << 10) | (m >> 13));
+}
+static float fromHalf(uint16_t h) {
+  uint32_t e = (h >> 10) & 31, m = h & 1023;
+  float v = e == 0 ? ldexpf((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float)(m | 1024), (int)e - 25);
+  return (h & 0x8000) ? -v : v;
+}
+static uint64_t rngState = 0x9E3779B97F4A7C15ull;
+static float rnd() {   // uniform in [-1, 1)
+  rngState ^= rngState << 13; rngState ^= rngState >> 7; rngState ^= rngState << 17;
+  return (float)((rngState >> 40) & 0xffffff) / 8388608.0f - 1.0f;
+}
 
 enum Shader { GEMM, WATTN, GATTN, OPS, SHADER_COUNT };
 static const char* shaderFiles[SHADER_COUNT] = {"gemm.spv", "wattn.spv", "gattn.spv", "ops.spv"};
@@ -84,6 +107,14 @@ struct Net {
   View scratch[5];  // 0 hidden, 1 qkv, 2 mid, 3 attention, 4 y
   uint32_t pushBytes = 0;
   uint64_t weightHalves = 0;
+  // Synthetic initialisation of a weight-pool region: uniform(-amp, amp), or the constant amp.
+  struct Init { VkDeviceSize offset; uint64_t halves; float amp; bool constant; };
+  std::vector<Init> inits;
+  const uint32_t noSpec[5] = {0, 16, 16, 8, 4};
+  bool profile = false;            // timestamp after every dispatch
+  std::string label;               // label of the next dispatch (profile mode)
+  std::vector<std::string> dispatchLabels;
+  std::vector<uint32_t> dispatchQuery;
 
   View W(uint64_t halves) {
     VkDeviceSize bytes = (halves * 2 + 255) / 256 * 256;
@@ -99,13 +130,13 @@ struct Net {
   }
   Act newAct(uint32_t tokens, uint32_t C) { return {makeBuffer((VkDeviceSize)pad128(tokens) * C * 2), tokens, C}; }
 
-  VkPipeline pipe(Shader s, uint32_t tn, uint32_t flags) {
-    uint64_t key = (uint64_t)s << 40 | (uint64_t)tn << 8 | flags;
+  // spec = {FLAGS, TXN, TYN, RT, NJ} for the GEMM (see gemm.comp); unused by the other shaders
+  VkPipeline pipe(Shader s, const uint32_t spec[5]) {
+    uint64_t key = (uint64_t)s << 40 | (uint64_t)spec[0] << 32 | spec[1] << 16 | spec[3] << 8 | spec[4];
     auto it = pipes.find(key);
     if (it != pipes.end()) return it->second;
-    uint32_t data[2] = {tn, flags};
-    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
-    VkSpecializationInfo si{2, me, 8, data};
+    VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}};
+    VkSpecializationInfo si{5, me, 20, spec};
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.layout = pl;
     ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, modules[s], "main",
@@ -123,7 +154,7 @@ struct Net {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
   }
 
-  void dispatch(Shader s, uint32_t tn, uint32_t flags, const View* bind[5], const void* push, uint32_t bytes, uint32_t x, uint32_t y,
+  void dispatch(Shader s, const uint32_t spec[5], const View* bind[5], const void* push, uint32_t bytes, uint32_t x, uint32_t y,
                 uint32_t z) {
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = dpool;
@@ -139,33 +170,53 @@ struct Net {
       w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, (uint32_t)i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[i], nullptr};
     }
     vkUpdateDescriptorSets(dev, 5, w, 0, nullptr);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe(s, tn, flags));
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe(s, spec));
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
     vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, bytes, push);
     vkCmdDispatch(cb, x, y, z);
     barrier();
     dispatches++;
+    if (profile) {
+      dispatchQuery.push_back(queries);
+      dispatchLabels.push_back(label);
+      vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, qpool, queries++);
+      stageNames.push_back("");
+    }
   }
 
   // C[M][N] = A * W (+silu) (+ R * scale), `batches` grouped GEMMs (see gemm.comp).
   void gemm(const View& A, const View& Wt, const View& C, const View* R, const View* Sc, uint32_t M, uint32_t N, uint32_t K, uint32_t lda,
             uint32_t ldc, uint32_t ldr, bool silu, uint32_t batches = 1, uint32_t aStride = 0, uint32_t cStride = 0, uint32_t rStride = 0) {
-    uint32_t tn = N % 128 == 0 ? 128 : N % 64 == 0 ? 64 : 32;
+    // Tile shape: 16 x 16 threads, 8 rows each; 8 / 4 / 2 columns per thread by the output width (measured: taller
+    // tiles for narrow outputs are slower, their A tile no longer fits well in shared memory). GEMMs with few rows
+    // shrink the rows per thread until there are enough threads to fill the GPU.
+    uint32_t txn = 16, tyn = 16, rt = 8, nj = N % 128 == 0 ? 4 : N % 64 == 0 ? 2 : 1, tn = txn * nj * 2;
+    while (rt > 1 && (uint64_t)((M + tyn * rt - 1) / (tyn * rt)) * (N / tn) * batches * 256 < 24000) rt /= 2;
     if (N % 32) { printf("N=%u not a multiple of 32\n", N); exit(1); }
     uint32_t push[10] = {M, N, K, lda, ldc, ldr, aStride, cStride, rStride, K * N / 2};
+    // std 0.3 / sqrt(K) keeps activations in f16 range through 71 residual blocks; skip scales are 1
+    inits.push_back({Wt.offset, Wt.size / 2, 0.3f * 1.7320508f / sqrtf((float)K), false});
+    if (Sc) inits.push_back({Sc->offset, Sc->size / 2, 1.0f, true});
     const View* bind[5] = {&A, &Wt, &C, R, Sc};
-    dispatch(GEMM, tn, (silu ? 1u : 0u) | (R ? 2u : 0u), bind, push, sizeof push, N / tn, (M + 127) / 128, batches);
+    char text[96];
+    snprintf(text, sizeof text, "gemm M=%-7u K=%-4u N=%-4u x%u", M, K, N, batches);
+    label = text;
+    const uint32_t spec[5] = {(silu ? 1u : 0u) | (R ? 2u : 0u), txn, tyn, rt, nj};
+    dispatch(GEMM, spec, bind, push, sizeof push, N / tn, (M + tyn * rt - 1) / (tyn * rt), batches);
   }
 
   void pool(const Act& in, Act& out, uint32_t w, uint32_t h) {
     uint32_t push[4] = {0, w, h, in.C};
     const View* bind[5] = {&in.v, nullptr, &out.v, nullptr, nullptr};
-    dispatch(OPS, 0, 0, bind, push, sizeof push, (w * h * (in.C / 2) + 255) / 256, 1, 1);
+    label = "pool / upsample";
+    dispatch(OPS, noSpec, bind, push, sizeof push, (w * h * (in.C / 2) + 255) / 256, 1, 1);
   }
   void upsampleAdd(const Act& low, const Act& skip, const View& scale, Act& out, uint32_t w, uint32_t h) {
+    inits.push_back({scale.offset, scale.size / 2, 1.0f, true});
     uint32_t push[4] = {1, w, h, out.C};
     const View* bind[5] = {&low.v, nullptr, &out.v, &skip.v, &scale};
-    dispatch(OPS, 0, 0, bind, push, sizeof push, (w * h * (out.C / 2) + 255) / 256, 1, 1);
+    label = "pool / upsample";
+    dispatch(OPS, noSpec, bind, push, sizeof push, (w * h * (out.C / 2) + 255) / 256, 1, 1);
   }
 
   void mark(const char* name) {
@@ -191,7 +242,7 @@ struct Net {
       hid = S(0, (uint64_t)Tp * E * 128 * 2);
       gemm(x.v, W((uint64_t)E * C * 128), hid, nullptr, nullptr, T, 128, C, C, E * 128, 0, true, E, 0, 128);
       gemm(hid, W((uint64_t)E * 128 * 32), mid, nullptr, nullptr, T, 32, 128, E * 128, C, 0, false, E, 128, 32);
-      gemm(mid, W((uint64_t)C * C), y, &x.v, &sc, T, C, C, C, C, C, C, false);
+      gemm(mid, W((uint64_t)C * C), y, &x.v, &sc, T, C, C, C, C, C, false);
     } else {  // 512: eight 64 -> 256 -> 64 branches, then 512 -> 512 carrying the skip
       hid = S(0, (uint64_t)Tp * 2048 * 2);
       gemm(x.v, W(8 * 64 * 256), hid, nullptr, nullptr, T, 256, 64, 512, 2048, 0, true, 8, 64, 256);
@@ -205,8 +256,12 @@ struct Net {
     uint32_t push[8] = {w, h, C, heads, sx, sy, nwx, 0};
     memcpy(&push[7], &qscale, 4);
     View prior = W((uint64_t)heads * 4096);
+    inits.push_back({prior.offset, prior.size / 2, 0.5f, false});
     const View* ab[5] = {&qkv, &prior, &att, nullptr, nullptr};
-    dispatch(WATTN, 0, 0, ab, push, sizeof push, nwx * nwy, heads, 1);
+    char text[96];
+    snprintf(text, sizeof text, "window attention T=%-7u C=%u", T, C);
+    label = text;
+    dispatch(WATTN, noSpec, ab, push, sizeof push, nwx * nwy, heads, 1);
     Act out = newAct(T, C);
     View sc2 = W(C);
     gemm(att, W((uint64_t)C * C), out.v, &y, &sc2, T, C, C, C, C, C, false);
@@ -225,7 +280,8 @@ struct Net {
     float qs = 5.65685f;  // sqrt(32)
     memcpy(&push[3], &qs, 4);
     const View* ab[5] = {&qkv, nullptr, &att, nullptr, nullptr};
-    dispatch(GATTN, 0, 0, ab, push, sizeof push, (T * 32 + 63) / 64, 1, 1);
+    label = "global attention (ViT)";
+    dispatch(GATTN, noSpec, ab, push, sizeof push, (T * 32 + 63) / 64, 1, 1);
     Act out = newAct(T, C);
     gemm(att, W((uint64_t)C * C), out.v, &y, &sc2, T, C, C, C, C, C, false);
     return out;
@@ -289,6 +345,9 @@ int main(int argc, char** argv) {
   for (uint32_t i = 0; i < qn; i++)
     if (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qi.queueFamilyIndex = i; break; }
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+  VkPhysicalDeviceFeatures f10{};
+  f10.shaderInt16 = VK_TRUE;
+  dci.pEnabledFeatures = &f10;
   dci.pNext = &f11;
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qi;
@@ -296,6 +355,7 @@ int main(int argc, char** argv) {
   volkLoadDevice(dev);
 
   Net net;
+  net.profile = argc > 4 && !strcmp(argv[4], "profile");
   net.family = qi.queueFamilyIndex;
   vkGetDeviceQueue(dev, net.family, 0, &net.queue);
   for (int i = 0; i < SHADER_COUNT; i++) {
@@ -337,7 +397,7 @@ int main(int argc, char** argv) {
   CK(vkAllocateCommandBuffers(dev, &cai, &net.cb));
   VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
   qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-  qpi.queryCount = 128;
+  qpi.queryCount = 1024;
   CK(vkCreateQueryPool(dev, &qpi, nullptr, &net.qpool));
 
   net.weights = makeBuffer(512ull << 20);
@@ -357,14 +417,10 @@ int main(int argc, char** argv) {
   for (auto& l : L) printf(" %ux%u", l.w, l.h);
   printf("\n");
 
+  Act feat = net.newAct(fw * fh, 16);
   VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   CK(vkBeginCommandBuffer(net.cb, &beginInfo));
-  vkCmdResetQueryPool(net.cb, net.qpool, 0, 128);
-  vkCmdFillBuffer(net.cb, net.weights.buffer, 0, VK_WHOLE_SIZE, 0x18081808);  // f16 ~0.002
-  vkCmdFillBuffer(net.cb, net.dummy.buffer, 0, VK_WHOLE_SIZE, 0);
-  Act feat = net.newAct(fw * fh, 16);
-  vkCmdFillBuffer(net.cb, feat.v.buffer, 0, VK_WHOLE_SIZE, 0x30003000);  // f16 0.125 input features
-  net.barrier();
+  vkCmdResetQueryPool(net.cb, net.qpool, 0, 1024);
   net.mark("start");
 
   // Encoder
@@ -417,27 +473,86 @@ int main(int argc, char** argv) {
   CK(vkEndCommandBuffer(net.cb));
   printf("recorded %u dispatches, synthetic weights %.0f MiB (f16)\n", net.dispatches, net.weightHalves * 2 / 1048576.0);
 
+  {  // synthetic data: random weights and input features, uploaded once through a staging buffer
+    VkDeviceSize wBytes = net.weightCursor, fBytes = feat.v.size;
+    View staging = makeBuffer(wBytes + fBytes, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void* map;
+    CK(vkMapMemory(dev, allBuffers.back().second, 0, VK_WHOLE_SIZE, 0, &map));
+    uint16_t* hw = (uint16_t*)map;
+    memset(hw, 0, wBytes);
+    for (const Net::Init& in : net.inits) {
+      uint16_t* dst = hw + in.offset / 2;
+      if (in.constant) { uint16_t c = toHalf(in.amp); for (uint64_t i = 0; i < in.halves; i++) dst[i] = c; }
+      else for (uint64_t i = 0; i < in.halves; i++) dst[i] = toHalf(rnd() * in.amp);
+    }
+    uint16_t* hf = hw + wBytes / 2;
+    for (uint64_t i = 0; i < fBytes / 2; i++) hf[i] = toHalf(rnd() * 0.5f);
+    VkCommandBuffer up;
+    CK(vkAllocateCommandBuffers(dev, &cai, &up));
+    CK(vkBeginCommandBuffer(up, &beginInfo));
+    VkBufferCopy c1{0, 0, wBytes}, c2{wBytes, 0, fBytes};
+    vkCmdCopyBuffer(up, staging.buffer, net.weights.buffer, 1, &c1);
+    vkCmdCopyBuffer(up, staging.buffer, feat.v.buffer, 1, &c2);
+    vkCmdFillBuffer(up, net.dummy.buffer, 0, VK_WHOLE_SIZE, 0);
+    CK(vkEndCommandBuffer(up));
+    VkSubmitInfo us{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    us.commandBufferCount = 1;
+    us.pCommandBuffers = &up;
+    CK(vkQueueSubmit(net.queue, 1, &us, VK_NULL_HANDLE));
+    CK(vkQueueWaitIdle(net.queue));
+  }
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &net.cb;
-  double best = 1e9, sum = 0;
-  std::vector<uint64_t> ts(net.queries), bestTs;
-  const int runs = 8;
-  for (int r = 0; r < runs; r++) {
+  const int runs = argc > 3 ? atoi(argv[3]) : 30;
+  std::vector<uint64_t> ts(net.queries);
+  std::vector<double> totals, stageMin(net.queries, 1e9);
+  const double tick = props.limits.timestampPeriod * 1e-6;
+  for (int r = 0; r < runs + 2; r++) {   // two warm-up frames
     CK(vkQueueSubmit(net.queue, 1, &si, VK_NULL_HANDLE));
     CK(vkQueueWaitIdle(net.queue));
     CK(vkGetQueryPoolResults(dev, net.qpool, 0, net.queries, ts.size() * 8, ts.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-    double ms = (ts.back() - ts.front()) * props.limits.timestampPeriod * 1e-6;
-    printf("run %d: %.1f ms\n", r, ms);
-    if (r > 0) { sum += ms; if (ms < best) { best = ms; bestTs = ts; } }
+    if (r < 2) continue;
+    totals.push_back((ts.back() - ts.front()) * tick);
+    for (uint32_t i = 1; i < net.queries; i++) stageMin[i] = std::min(stageMin[i], (ts[i] - ts[i - 1]) * tick);
   }
-  printf("\nstage breakdown (best run):\n");
-  for (uint32_t i = 1; i < net.queries; i++)
-    printf("  %-34s %8.2f ms\n", net.stageNames[i].c_str(), (bestTs[i] - bestTs[i - 1]) * props.limits.timestampPeriod * 1e-6);
-  printf("\nTOTAL best %.1f ms (%.1f fps) | mean %.1f ms | %ux%u on %s\n", best, 1000 / best, sum / (runs - 1), W, H, props.deviceName);
+  if (net.profile) {   // per-dispatch minima, grouped by label
+    std::map<std::string, std::pair<double, int>> groups;
+    for (size_t i = 0; i < net.dispatchQuery.size(); i++) {
+      auto& g = groups[net.dispatchLabels[i]];
+      g.first += stageMin[net.dispatchQuery[i]];
+      g.second++;
+    }
+    std::vector<std::pair<double, std::string>> rows;
+    for (auto& g : groups) {
+      char text[160];
+      snprintf(text, sizeof text, "%-40s x%-3d %7.2f ms  (%.3f each)", g.first.c_str(), g.second.second, g.second.first, g.second.first / g.second.second);
+      rows.push_back({g.second.first, text});
+    }
+    std::sort(rows.rbegin(), rows.rend());
+    double all = 0;
+    for (auto& r : rows) all += r.first;
+    printf("\nper-dispatch profile (minimum over %d frames), total %.1f ms:\n", runs, all);
+    for (auto& r : rows) printf("  %s\n", r.second.c_str());
+    return 0;
+  }
+  std::sort(totals.begin(), totals.end());
+  // Other applications take GPU time slices at random points of a frame, so the per-stage minimum over the runs is
+  // the stage's own cost; the frame totals show what the machine delivered.
+  double sumMin = 0;
+  printf("\nstage (minimum over %d frames):\n", runs);
+  for (uint32_t i = 1; i < net.queries; i++) {
+    printf("  %-34s %8.2f ms\n", net.stageNames[i].c_str(), stageMin[i]);
+    sumMin += stageMin[i];
+  }
+  printf("\nframe: min %.1f ms (%.1f fps) | median %.1f ms (%.1f fps) | max %.1f ms | sum of stage minima %.1f ms\n", totals.front(),
+         1000 / totals.front(), totals[totals.size() / 2], 1000 / totals[totals.size() / 2], totals.back(), sumMin);
+  printf("%ux%u on %s, %u dispatches\n", W, H, props.deviceName, net.dispatches);
   void* mapped;
   vkMapMemory(dev, readbackMemory, 0, 64, 0, &mapped);
   const uint16_t* hv = (const uint16_t*)mapped;
-  printf("head[0..3] raw f16: %04x %04x %04x %04x (synthetic weights: values are not an image)\n", hv[0], hv[1], hv[2], hv[3]);
+  printf("head[0..7]:");
+  for (int i = 0; i < 8; i++) printf(" %.4g", fromHalf(hv[i]));
+  printf("  (synthetic weights: not an image; finite non-zero values mean the data path is alive)\n");
   return 0;
 }

@@ -1,8 +1,10 @@
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 // 8x8 shifted-window scaled-cosine attention. One workgroup = one window x one head (32 channels), one thread per token.
 // Tokens outside the field are zero vectors that still take part (score = prior + 0), as in the reference graph.
+// The exponential is the network's bit trick on the half (docs/network.md), not a transcendental.
 layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) readonly buffer QKV { f16vec2 qkv[]; };         // [tokens][3C] q | k | v
 layout(std430, set = 0, binding = 1) readonly buffer Prior { float16_t prior[]; };   // [heads][64][64]
@@ -37,13 +39,15 @@ void main() {
   f16vec2 o[16];
   for (uint d = 0; d < 16; d++) o[d] = f16vec2(0.0hf);
   float sum = 0.0;
+  uint pb = h * 4096 + t * 64;
   for (uint j = 0; j < 64; j++) {
-    f16vec2 acc = f16vec2(0.0hf);
+    f16vec2 acc = f16vec2(prior[pb + j], float16_t(0.0));
     for (uint d = 0; d < 16; d++) acc = fma(q[d], sk[j][d], acc);
-    float s = float(acc.x) + float(acc.y) + float(prior[h * 4096 + t * 64 + j]);
-    float e = exp(s);
-    sum += e;
-    f16vec2 e2 = f16vec2(float16_t(e));
+    float16_t s = acc.x + acc.y;
+    float16_t x = clamp(fma(float16_t(0.044921875), s, float16_t(1.30078125)), float16_t(1.03125), float16_t(1.5693359375));
+    float16_t e = uint16BitsToFloat16(uint16_t((uint(float16BitsToUint16(x)) << 5) ^ 0x8000u));
+    sum += float(e);
+    f16vec2 e2 = f16vec2(e, e);
     for (uint d = 0; d < 16; d++) o[d] = fma(e2, sv[j][d], o[d]);
   }
   if (valid) {

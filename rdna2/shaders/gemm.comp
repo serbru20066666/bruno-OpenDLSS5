@@ -2,12 +2,17 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 // RDNA2 path: C[M][N] = A[M][K] * B[K][N] (+ SiLU) (+ residual * per-channel scale), f16 storage, packed-f16 accumulation.
-// 128-row tile x TN columns per workgroup, 256 threads, 8 rows x TN/16 columns per thread. z = batch (grouped GEMMs):
-// A/C/R column offsets advance by aStride/cStride/rStride per batch, B by bStride (in f16 pairs). Row counts need no bounds checks
-// (activations are allocated with rows padded to 128); N must be a multiple of TN.
-layout(local_size_x = 16, local_size_y = 16) in;
-layout(constant_id = 0) const uint TN = 128;
-layout(constant_id = 1) const uint FLAGS = 0;   // 1 = SiLU, 2 = residual
+// 256 threads per workgroup laid out TXN (columns) x TYN (rows); each thread owns RT rows x NJ f16 pairs. The host picks
+// the shape: narrow outputs get fewer columns per thread, GEMMs with few rows get small RT so enough threads exist to
+// fill the GPU. z = batch (grouped GEMMs): A/C/R column offsets advance by aStride/cStride/rStride per batch, B by
+// bStride (in f16 pairs). No row bounds checks: activations are allocated with rows padded to 128. N must be a multiple
+// of the tile width TXN * NJ * 2.
+layout(constant_id = 0) const uint FLAGS = 0;   // 1 = SiLU, 2 = residual
+layout(constant_id = 1) const uint TXN = 16;
+layout(constant_id = 2) const uint TYN = 16;
+layout(constant_id = 3) const uint RT = 8;
+layout(constant_id = 4) const uint NJ = 4;
+layout(local_size_x_id = 1, local_size_y_id = 2) in;
 layout(std430, set = 0, binding = 0) readonly buffer A { f16vec2 a[]; };
 layout(std430, set = 0, binding = 1) readonly buffer B { f16vec2 b[]; };
 layout(std430, set = 0, binding = 2) writeonly buffer C { f16vec2 c[]; };
@@ -15,42 +20,42 @@ layout(std430, set = 0, binding = 3) readonly buffer R { f16vec2 r[]; };
 layout(std430, set = 0, binding = 4) readonly buffer S { f16vec2 s[]; };
 layout(push_constant) uniform P { uint M, N, K, lda, ldc, ldr, aStride, cStride, rStride, bStride; } p;
 const uint BK = 16;
-const uint NJ = TN / 32;
-shared float16_t As[BK][128 + 2];
-shared f16vec2 Bs[BK][TN / 2];
+const uint TR = TYN * RT;     // tile rows
+const uint TN2 = TXN * NJ;    // tile columns, in f16 pairs
+shared float16_t As[BK][TR + 2];
+shared f16vec2 Bs[BK][TN2];
 void main() {
-  uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 16 + tx;
-  uint row0 = gl_WorkGroupID.y * 128, col0 = gl_WorkGroupID.x * TN, z = gl_WorkGroupID.z;
-  f16vec2 acc[8][NJ];
-  for (uint i = 0; i < 8; i++) for (uint j = 0; j < NJ; j++) acc[i][j] = f16vec2(0.0hf);
+  uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * TXN + tx;
+  uint row0 = gl_WorkGroupID.y * TR, col0 = gl_WorkGroupID.x * TN2 * 2, z = gl_WorkGroupID.z;
+  f16vec2 acc[RT][NJ];
+  for (uint i = 0; i < RT; i++) for (uint j = 0; j < NJ; j++) acc[i][j] = f16vec2(0.0hf);
   uint N2 = p.N / 2;
   uint aBase = z * p.aStride, bBase = z * p.bStride;
   for (uint k0 = 0; k0 < p.K; k0 += BK) {
-    for (uint l = 0; l < 4; l++) {
-      uint idx = tid + l * 256;
+    for (uint idx = tid; idx < TR * 8; idx += 256) {
       uint m = idx / 8, kk = (idx % 8) * 2;
       f16vec2 v = a[((row0 + m) * p.lda + aBase + k0 + kk) / 2];
-      As[kk][m] = v.x; As[kk + 1][m] = v.y;
+      As[kk][m] = v.x;
+      As[kk + 1][m] = v.y;
     }
-    for (uint l = 0; l < NJ; l++) {
-      uint idx = tid + l * 256;
-      uint kk = idx / (TN / 2), n2 = idx % (TN / 2);
+    for (uint idx = tid; idx < BK * TN2; idx += 256) {
+      uint kk = idx / TN2, n2 = idx % TN2;
       Bs[kk][n2] = b[bBase + (k0 + kk) * N2 + col0 / 2 + n2];
     }
     barrier();
     for (uint kk = 0; kk < BK; kk++) {
       f16vec2 bv[NJ];
       for (uint j = 0; j < NJ; j++) bv[j] = Bs[kk][tx * NJ + j];
-      for (uint i = 0; i < 8; i++) {
-        float16_t av = As[kk][ty * 8 + i];
+      for (uint i = 0; i < RT; i++) {
+        float16_t av = As[kk][ty * RT + i];
         f16vec2 a2 = f16vec2(av, av);
         for (uint j = 0; j < NJ; j++) acc[i][j] = fma(a2, bv[j], acc[i][j]);
       }
     }
     barrier();
   }
-  for (uint i = 0; i < 8; i++) {
-    uint row = row0 + ty * 8 + i;
+  for (uint i = 0; i < RT; i++) {
+    uint row = row0 + ty * RT + i;
     for (uint j = 0; j < NJ; j++) {
       uint col = col0 + (tx * NJ + j) * 2;
       f16vec2 v = acc[i][j];
