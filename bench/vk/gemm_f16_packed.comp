@@ -1,0 +1,49 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// C[M][N] = A[M][K] * B[K][N], all f16, f16 accumulation in packed f16vec2 (RDNA2 rapid packed math).
+// 128x128 tile per workgroup, 256 threads, 8x8 outputs per thread. M padded to 128 and N to 128 by the host.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer A { f16vec2 a[]; };   // [M][K/2]
+layout(std430, set = 0, binding = 1) readonly buffer B { f16vec2 b[]; };   // [K][N/2]
+layout(std430, set = 0, binding = 2) writeonly buffer C { f16vec2 c[]; };  // [M][N/2]
+layout(push_constant) uniform P { uint M, N, K; } p;
+const uint BK = 16;
+shared float16_t As[BK][128 + 2];   // transposed: As[k][m]
+shared f16vec2 Bs[BK][64];          // Bs[k][n/2]
+void main() {
+  uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 16 + tx;
+  uint row0 = gl_WorkGroupID.y * 128, col0 = gl_WorkGroupID.x * 128;
+  f16vec2 acc[8][4];
+  for (int i = 0; i < 8; i++) for (int j = 0; j < 4; j++) acc[i][j] = f16vec2(0.0hf);
+  uint K2 = p.K / 2, N2 = p.N / 2;
+  for (uint k0 = 0; k0 < p.K; k0 += BK) {
+    // A tile 128x16: each thread loads 4 f16vec2 (8 halves)
+    for (uint l = 0; l < 4; l++) {
+      uint idx = tid + l * 256;            // 0..1023 over 128 rows x 8 pairs
+      uint m = idx / 8, kk = (idx % 8) * 2;
+      f16vec2 v = a[(row0 + m) * K2 + (k0 + kk) / 2];
+      As[kk][m] = v.x; As[kk + 1][m] = v.y;
+    }
+    // B tile 16x128: 16 rows x 64 pairs = 1024 pairs
+    for (uint l = 0; l < 4; l++) {
+      uint idx = tid + l * 256;
+      uint kk = idx / 64, n2 = idx % 64;
+      Bs[kk][n2] = b[(k0 + kk) * N2 + col0 / 2 + n2];
+    }
+    barrier();
+    for (uint kk = 0; kk < BK; kk++) {
+      f16vec2 bv[4];
+      for (uint j = 0; j < 4; j++) bv[j] = Bs[kk][tx * 4 + j];
+      for (uint i = 0; i < 8; i++) {
+        float16_t av = As[kk][ty * 8 + i];
+        f16vec2 a2 = f16vec2(av, av);
+        for (uint j = 0; j < 4; j++) acc[i][j] = fma(a2, bv[j], acc[i][j]);
+      }
+    }
+    barrier();
+  }
+  for (uint i = 0; i < 8; i++)
+    for (uint j = 0; j < 4; j++)
+      c[(row0 + ty * 8 + i) * N2 + col0 / 2 + tx * 4 + j] = acc[i][j];
+}

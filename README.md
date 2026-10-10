@@ -28,7 +28,8 @@ emulator window -> capture -> [ neural rendering backend ] -> NR OFF / NR ON vie
 
 1. [x] Open repo, MIT licence, attribution to the upstream project.
 2. [x] RPCS3 capture frontend with NR OFF / NR ON split view (prototype).
-3. [ ] Measure capture + display overhead and baseline fps with GoW3 on RDNA2.
+3. [x] Measure packed-FP16 GEMM throughput on RDNA2 (`bench/vk`): 15-20 TFLOPS on the network's mid-size shapes
+   on an RX 6800 XT (about 7x what DirectML gave). Capture overhead with GoW3 still to measure.
 4. [ ] AMD compute backend: replace `VK_NV_cooperative_matrix2` / FP8 / `VK_NV_cuda_kernel_launch` with
    `VK_KHR_cooperative_matrix` (RDNA3/4) and a packed-FP16 / DP4a path (RDNA2).
 5. [ ] Validate numerically against the upstream bit-exact reference.
